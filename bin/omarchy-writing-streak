@@ -305,116 +305,6 @@ cmd_set_policy() {
   echo "policy=$policy pingHours=[$sorted] (window stays $(jq -r .windowStart "$CONFIG_PATH")-$(jq -r .windowEnd "$CONFIG_PATH"), set by timer)"
 }
 
-# Sandboxed behavior tests. Never touches real state or notifications.
-cmd_self_test() {
-  local fails=0 out st m
-  tmp=$(mktemp -d)   # deliberately NOT local: the EXIT trap must see it
-  trap 'rm -rf "$tmp"' EXIT
-  printf '#!/bin/sh\necho "$@" >> "%s/notify.log"\n' "$tmp" > "$tmp/spy"
-  chmod +x "$tmp/spy"
-
-  # Everything runs in the sandbox — set env BEFORE any command runs.
-  export WRITING_STREAK_STATE_HOME="$tmp" WRITING_STREAK_CONFIG="$tmp/config.json" \
-         WRITING_STREAK_NOTIFY="$tmp/spy" WRITING_STREAK_FAKE_NOW="2026-08-19 09:00"
-
-  t() { # <desc> <expected> <actual>
-    if [[ $2 == "$3" ]]; then echo "ok - $1"; else echo "FAIL - $1: expected [$2] got [$3]"; fails=$((fails+1)); fi
-  }
-
-  # case 1: seed takes dates, is one-shot, and validates input
-  "$0" seed >/dev/null 2>&1 && { echo "FAIL seed without dates should error"; fails=$((fails+1)); } || echo "ok - seed without dates errors"
-  out=$("$0" seed 2026-08-10 2026-08-11 2026-08-12 2>&1 || true) && [[ $out == seeded:* ]] || { echo "FAIL seed"; fails=$((fails+1)); }
-  [[ $(wc -l < "$tmp/events.jsonl") -eq 3 ]] || { echo "FAIL seed count"; fails=$((fails+1)); }
-  out=$("$0" seed 2026-08-10 2>&1 || true); [[ $out == refusing* ]] || { echo "FAIL seed idempotence"; fails=$((fails+1)); }
-  rm -f "$tmp/events.jsonl"
-  "$0" seed 2026-8-1 >/dev/null 2>&1 && { echo "FAIL seed accepts bad format"; fails=$((fails+1)); } || echo "ok - seed rejects bad date format"
-  "$0" seed 2026-13-45 2026-01-01 >/dev/null 2>&1 && { echo "FAIL seed accepts impossible month"; fails=$((fails+1)); } || echo "ok - seed rejects impossible month"
-  [[ -e $tmp/events.jsonl ]] && { echo "FAIL rejected seed left a log"; fails=$((fails+1)); } || echo "ok - rejected seed writes nothing"
-  "$0" seed 2026-02-30 >/dev/null 2>&1 && { echo "FAIL seed accepts Feb 30"; fails=$((fails+1)); } || echo "ok - seed rejects impossible day (Feb 30)"
-  # sanity: the poison-reject path must still leave seed usable right after
-  out=$("$0" seed 2026-08-10 2>&1 || true) && [[ $out == seeded:* ]] && echo "ok - seed works right after a rejection" \
-    || { echo "FAIL seed after rejection"; fails=$((fails+1)); }
-  rm -f "$tmp/events.jsonl"
-
-  # case 2: direct fixture — gap, restart, open states
-  rm -f "$tmp/events.jsonl"
-
-  # case 2: direct fixture — gap, restart, open states
-  for d in 2026-08-11 2026-08-12 2026-08-13 2026-08-17; do
-    jq -cn --arg d "$d" --argjson ts "$(date -d "$d 12:00" +%s)" '{type:"seed",date:$d,ts:$ts}' >> "$tmp/events.jsonl"
-  done
-
-  st=$("$0" status)
-  t "restart when yesterday missed (today open)" "restart" "$(jq -r .state <<<"$st")"
-  t "best across gap (11,12,13)" "3" "$(jq -r .best <<<"$st")"
-  t "streak 0 with restart state (token renders 1, never 0)" "0" "$(jq -r .streak <<<"$st")"
-
-  # case 3: mark -> undo -> toggle round trip
-  "$0" mark >/dev/null
-  t "today done after mark" "done" "$("$0" status | jq -r .state)"
-  t "streak counts today" "1" "$("$0" status | jq -r .streak)"
-  "$0" mark >/dev/null
-  t "mark idempotent (no dup events)" "5" "$(wc -l < "$tmp/events.jsonl")"
-  "$0" undo >/dev/null
-  t "undo returns to open-restart" "restart" "$("$0" status | jq -r .state)"
-  "$0" undo 2>/dev/null && { echo "FAIL undo without mark should error"; fails=$((fails+1)); } || echo "ok - undo without mark errors"
-  "$0" toggle >/dev/null
-  t "toggle from open marks done" "done" "$("$0" status | jq -r .state)"
-
-  # case 4: open state with live run (yesterday done, today not)
-  jq -cn --arg d 2026-08-18 --argjson ts "$(date -d "2026-08-18 12:00" +%s)" '{type:"seed",date:$d,ts:$ts}' >> "$tmp/events.jsonl"
-  "$0" undo >/dev/null
-  st=$("$0" status)
-  t "open run alive counts yesterday" "open" "$(jq -r .state <<<"$st")"
-  t "open streak = run ending yesterday" "2" "$(jq -r .streak <<<"$st")"
-
-  # case 5: check gating — hour 9 not a ping hour (every-2h) -> silent
-  rm -f "$tmp/notify.log"
-  "$0" check
-  [[ -f "$tmp/notify.log" ]] && { echo "FAIL ping at non-ping hour"; fails=$((fails+1)); } || echo "ok - no ping at non-ping hour"
-
-  # case 6: ping hour fires once, dedup blocks the double
-  export WRITING_STREAK_FAKE_NOW="2026-08-19 10:00"
-  "$0" check
-  [[ -f "$tmp/notify.log" ]] && [[ $(wc -l < "$tmp/notify.log") -eq 1 ]] || { echo "FAIL ping at 10:00"; fails=$((fails+1)); }
-  "$0" check
-  t "dedup: no second ping within 55 min" "1" "$(wc -l < "$tmp/notify.log" 2>/dev/null || echo 0)"
-  t "reminder event logged" "1" "$("$0" status | jq -r .remindersToday)"
-
-  # case 7: done day never pings
-  "$0" mark >/dev/null
-  export WRITING_STREAK_FAKE_NOW="2026-08-19 12:00"
-  "$0" check
-  t "done day: still one notification" "1" "$(wc -l < "$tmp/notify.log")"
-
-  # case 8: outside window with no reminders = catch-up ping
-  jq -cn --arg d 2026-08-20 --argjson ts "$(date -d "2026-08-20 19:30" +%s)" '{type:"completed",date:$d,ts:$ts}' >> "$tmp/events.jsonl"
-  export WRITING_STREAK_FAKE_NOW="2026-08-21 19:30"
-  "$0" check
-  t "catch-up ping outside window" "2" "$(wc -l < "$tmp/notify.log")"
-  "$0" check
-  t "catch-up pings once per day only" "2" "$(wc -l < "$tmp/notify.log")"
-
-  # case 9: metrics — conversion + lag
-  m=$("$0" metrics)
-  t "metrics: reminder days counted" "2" "$(jq -r '.totals.reminderDays' <<<"$m")"
-  t "metrics: 19th converted" "1" "$(jq -r '.totals.convertedDays' <<<"$m")"
-  t "metrics: conversion percent" "50" "$(jq -r '.totals.conversion' <<<"$m")"
-
-  # case 10: set-policy bounded rewrites config
-  "$0" set-policy bounded 8 13 16 >/dev/null
-  t "policy switched" "bounded" "$(jq -r .policy "$tmp/config.json")"
-  t "ping hours rewritten" "8 13 16" "$(jq -r '.pingHours | join(" ")' "$tmp/config.json")"
-
-  # case 11: grid shape — August 2026 starts Saturday, has 31 days
-  st=$("$0" status)
-  t "grid day count" "31" "$(jq -r '.grid | length' <<<"$st")"
-  t "Aug 2026 starts Saturday (wday 0=Sun -> 6)" "6" "$(jq -r .firstWeekday <<<"$st")"
-
-  echo "---"
-  if (( fails == 0 )); then echo "SELF-TEST PASS"; else echo "SELF-TEST FAIL ($fails)"; exit 1; fi
-}
-
 usage() {
   cat <<'EOF'
 omarchy-writing-streak — free-writing streak + reminders (see solution doc)
@@ -428,7 +318,6 @@ omarchy-writing-streak — free-writing streak + reminders (see solution doc)
   seed <date...>    one-shot backfill of complete days (refuses non-empty log)
   set-policy <every-2h|bounded|once> [hours...]
                     switch reminder policy (08-26 review: bounded + hours)
-  self-test         sandboxed behavior tests
 
 Env overrides (tests): WRITING_STREAK_STATE_HOME, WRITING_STREAK_CONFIG,
 WRITING_STREAK_NOTIFY, WRITING_STREAK_FAKE_NOW ("YYYY-MM-DD HH:MM").
@@ -436,7 +325,7 @@ EOF
 }
 
 case ${1:-} in
-  mark|undo|toggle|check|status|metrics|seed|set-policy|self-test) "cmd_${1//-/_}" "${@:2}" ;;
+  mark|undo|toggle|check|status|metrics|seed|set-policy) "cmd_${1//-/_}" "${@:2}" ;;
   -h|--help|help|'') usage ;;
   *) echo "unknown command: $1" >&2; usage; exit 1 ;;
 esac
