@@ -8,7 +8,7 @@ import qs.Ui
 // Free-writing streak widget — a VIEWER, nothing more.
 // All state and policy live in the omarchy-writing-streak CLI and its event
 // log; this file shells out to `status` and renders. Never add streak math
-// here (see reference/streak-reminder-widget-implementation-log.md).
+// here (design record: docs/DESIGN.md in the repo).
 //
 // Anti-shaming rules (solution doc §4): the number 0 is never rendered;
 // states are done | open | restart; no red, no ✗, no escalating anything.
