@@ -1,0 +1,418 @@
+#!/bin/bash
+# omarchy-writing-streak — free-writing practice streak + reminder policy.
+#
+# Design: writing/projects/free-writing/reference/streak-reminder-widget-solution.md
+# Build log:  .../streak-reminder-widget-implementation-log.md
+#
+# The append-only event log (~/.local/state/omarchy/writing-streak/events.jsonl)
+# is the ONLY truth. Every command either appends an event or derives state from
+# the log. Never add logic elsewhere (the shell plugin is a viewer, not a computer).
+#
+# Event shapes (one JSON object per line):
+#   {"type":"seed","date":"YYYY-MM-DD","ts":<epoch>}      backfilled complete day
+#   {"type":"completed","date":"...","ts":<epoch>}        practice session happened
+#   {"type":"undone","date":"...","ts":<epoch>}           same-day accidental mark, reverted
+#   {"type":"reminder","date":"...","ts":<epoch>}         a ping fired (never changes day state)
+#
+# Anti-shaming rules encoded here (solution doc §4): the number 0 is never a
+# display value; states are done | open | restart; notification copy is neutral config.
+
+set -euo pipefail
+
+STATE_HOME="${WRITING_STREAK_STATE_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/writing-streak}"
+CONFIG_PATH="${WRITING_STREAK_CONFIG:-$HOME/.config/omarchy/writing-streak.json}"
+EVENTS="$STATE_HOME/events.jsonl"
+NOTIFY_CMD="${WRITING_STREAK_NOTIFY:-omarchy-notification-send}"
+FAKE_NOW="${WRITING_STREAK_FAKE_NOW:-}"
+
+DEFAULT_CONFIG='{"policy":"every-2h","pingHours":[6,8,10,12,14,16],"windowStart":6,"windowEnd":17,"title":"Free writing","body":"No session logged today yet.","glyph":"✒"}'
+
+# --------------------------------------------------------------------- time
+
+_now()  { if [[ -n $FAKE_NOW ]]; then date -d "$FAKE_NOW" +%s; else date +%s; fi; }
+_today() { if [[ -n $FAKE_NOW ]]; then date -d "$FAKE_NOW" +%F; else date +%F; fi; }
+_hour() { if [[ -n $FAKE_NOW ]]; then date -d "$FAKE_NOW" +%-H; else date +%-H; fi; }
+
+# ------------------------------------------------------------------- events
+
+ensure_log() {
+  mkdir -p "$STATE_HOME"
+  [[ -f $EVENTS ]] || touch "$EVENTS"
+}
+
+append_event() { # <type> <date> [ts]
+  ensure_log
+  local type=$1 date=$2 ts=${3:-}
+  [[ -n $ts ]] || ts=$(_now)
+  jq -cn --arg type "$type" --arg date "$date" --argjson ts "$ts" \
+    '{type:$type,date:$date,ts:$ts}' >> "$EVENTS"
+}
+
+# ------------------------------------------------------------------ derived
+
+# Map of date -> true/false (last deciding event per date wins). Prints "{}" if no log.
+day_state() {
+  if [[ ! -f $EVENTS ]]; then echo '{}'; return; fi
+  jq -Rs '
+    split("\n") | map(select(length > 0)) | map(try fromjson catch null)
+    | map(select(. != null and .date != null))
+    | reduce .[] as $e ({};
+        if ($e.type == "completed") or ($e.type == "seed") then .[$e.date] = true
+        elif $e.type == "undone" then .[$e.date] = false
+        else . end)' "$EVENTS"
+}
+
+_today_done() { # exit 0 if today's deciding state is complete
+  local d t
+  d=$(day_state)
+  t=$(_today)
+  jq -e --arg t "$t" '.[$t] == true' <<<"$d" >/dev/null
+}
+
+# All reminder events for one date, oldest first: [{"date":..,"ts":..}]
+reminders_for() {
+  local d=$1
+  if [[ ! -f $EVENTS ]]; then echo '[]'; return; fi
+  jq -Rs --arg d "$d" '
+    split("\n") | map(select(length > 0)) | map(try fromjson catch null)
+    | map(select(. != null and .type == "reminder" and .date == $d)) | sort_by(.ts)' "$EVENTS"
+}
+
+load_config() {
+  if [[ ! -s $CONFIG_PATH ]]; then echo "$DEFAULT_CONFIG"; return; fi
+  jq -n --argjson defaults "$DEFAULT_CONFIG" --slurpfile f "$CONFIG_PATH" \
+    '$defaults * ($f[0] // {})' 2>/dev/null || echo "$DEFAULT_CONFIG"
+}
+
+# ------------------------------------------------------------------ commands
+
+cmd_seed() {
+  if [[ -s $EVENTS ]]; then
+    echo "refusing to seed: $EVENTS is not empty" >&2
+    exit 1
+  fi
+  # Complete days per solution doc D3 (evidence: session files + NOTES.md tracker).
+  local d
+  for d in 2026-08-12 2026-08-13 2026-08-19; do
+    append_event seed "$d" "$(date -d "$d 12:00" +%s)"
+  done
+  echo "seeded: 2026-08-12, 2026-08-13, 2026-08-19 (complete)"
+}
+
+cmd_mark() {
+  local today; today=$(_today)
+  if _today_done; then echo "already marked: $today"; return 0; fi
+  append_event completed "$today"
+  echo "marked: $today"
+}
+
+cmd_undo() {
+  local today; today=$(_today)
+  if ! _today_done; then
+    echo "nothing to undo: $today is not marked" >&2
+    exit 1
+  fi
+  append_event undone "$today"
+  echo "undone: $today"
+}
+
+cmd_toggle() {
+  if _today_done; then cmd_undo; else cmd_mark; fi
+}
+
+# The reminder policy gate. Runs from systemd hourly 06:00-17:00 (timer is dumb
+# on purpose; the policy lives here, in config).
+#   - today done            -> silent, nothing logged
+#   - hour in pingHours     -> ping, unless one fired < 55 min ago (Persistent catch-up overlap)
+#   - hour inside window but not a ping hour -> silent (e.g. odd hours under every-2h)
+#   - hour outside window   -> catch-up case (boot/wake catch-up fire): ping only if
+#                              today has had zero reminders so far
+cmd_check() {
+  local today hour cfg ws we now
+  today=$(_today)
+  hour=$(_hour)
+  cfg=$(load_config)
+  ws=$(jq -r '.windowStart' <<<"$cfg")
+  we=$(jq -r '.windowEnd' <<<"$cfg")
+
+  if _today_done; then exit 0; fi
+
+  local should_ping=0
+  if jq -e --argjson h "$hour" '([.pingHours[]] | index($h)) != null' <<<"$cfg" >/dev/null; then
+    should_ping=1
+  fi
+  if (( hour < ws || hour >= we )); then
+    local n; n=$(reminders_for "$today" | jq 'length')
+    if (( n == 0 )); then should_ping=1; else should_ping=0; fi
+  fi
+  (( should_ping == 1 )) || exit 0
+
+  # Dedup: systemd Persistent catch-up can stack fires close together.
+  local last
+  last=$(reminders_for "$today" | jq 'if length > 0 then .[-1].ts else 0 end')
+  now=$(_now)
+  if (( now - last < 3300 )); then exit 0; fi
+
+  append_event reminder "$today"
+
+  if [[ ${WRITING_STREAK_DRYRUN:-0} != "1" ]]; then
+    $NOTIFY_CMD \
+      -g "$(jq -r '.glyph' <<<"$cfg")" \
+      "$(jq -r '.title' <<<"$cfg")" \
+      "$(jq -r '.body' <<<"$cfg")" >/dev/null 2>&1 || true
+  fi
+}
+
+# One JSON blob for the shell plugin (and curious humans piping through jq).
+cmd_status() {
+  local today state cfg reminders hour now
+  today=$(_today)
+  state=$(day_state)
+  cfg=$(load_config)
+  reminders=$(reminders_for "$today")
+  hour=$(_hour)
+  now=$(_now)
+
+  jq -n \
+    --arg today "$today" \
+    --argjson state "$state" \
+    --argjson cfg "$cfg" \
+    --argjson reminders "$reminders" \
+    --argjson hour "$hour" \
+    --argjson now "$now" '
+    def pd($d): ($d | strptime("%Y-%m-%d") | mktime);
+    def fd($t): ($t | gmtime | strftime("%Y-%m-%d"));
+    (pd($today)) as $t0
+    | ($state[$today] == true) as $doneToday
+    # run lengths: recursive walk back while day is complete
+    | def runlen($t): if $state[fd($t)] == true then 1 + runlen($t - 86400) else 0 end;
+      (runlen($t0)) as $rToday
+      | (runlen($t0 - 86400)) as $rYday
+      | (if $doneToday then {state: "done", streak: $rToday}
+       elif $rYday > 0 then {state: "open", streak: $rYday}
+       else {state: "restart", streak: 0}
+       end) as $cur
+    # longest complete run in the whole log
+    | ([$state | keys_unsorted[] | select($state[.] == true)] | sort) as $done
+    | (if ($done | length) == 0 then 0
+       else (reduce range(1; $done | length) as $i ({best: 1, cur: 1};
+              if (pd($done[$i]) - pd($done[$i-1])) == 86400 then .cur += 1 else .cur = 1 end
+              | .best = ([.best, .cur] | max)) | .best)
+       end) as $best
+    # current-month grid (dates only; QML renders)
+    | ($today | .[0:7]) as $ym
+    | (pd($ym + "-01")) as $m0
+    | (pd((fd($m0 + 32 * 86400)) | .[0:7] + "-01")) as $m1
+    | ((($m1 - $m0) / 86400) | round) as $nDays
+    | (($m0 | gmtime)[6]) as $w0  # 0=Sunday
+    | ([range(0; $nDays) | fd($m0 + . * 86400)
+        | {date: .,
+           done: ($state[.] == true),
+           future: (pd(.) > $t0),
+           isToday: (. == $today)}]) as $grid
+    # next scheduled ping hour for the footer (null when day is done)
+    | (if $doneToday then null
+       else ([($cfg.pingHours | sort)[] | select(. > $hour)] | first) as $next
+        | if $next != null then {hour: $next, tomorrow: false}
+          else {hour: ($cfg.pingHours | min), tomorrow: true} end
+       end) as $nextPing
+    | {today: $today,
+       todayDone: $doneToday,
+       state: $cur.state,
+       streak: $cur.streak,
+       best: $best,
+       canUndo: $doneToday,
+       month: $ym,
+       firstWeekday: $w0,
+       grid: $grid,
+       remindersToday: ($reminders | length),
+       policy: $cfg.policy,
+       pingHours: ($cfg.pingHours | sort),
+       nextPing: $nextPing}'
+}
+
+# M3 + time-to-comply: the numbers the 2026-08-26 step-down review reads.
+cmd_metrics() {
+  if [[ ! -f $EVENTS ]]; then echo '{"days":[],"totals":{"reminderDays":0,"convertedDays":0,"conversion":null}}'; return; fi
+  local state; state=$(day_state)
+  jq -Rs --argjson state "$state" '
+    split("\n") | map(select(length > 0)) | map(try fromjson catch null)
+    | map(select(. != null and .date != null)) as $ev
+    | ([$ev[] | select(.type == "reminder")] | sort_by(.ts) | group_by(.date)) as $groups
+    | ($groups | map(
+        (.[0].date) as $d
+        | ($state[$d] == true) as $done
+        | ([ $ev[] | select(.date == $d and .type == "completed") | .ts ] | if length > 0 then max else null end) as $doneTs
+        | {date: $d,
+           reminders: length,
+           firstReminderHour: ((map(.ts) | min) | localtime | strftime("%H")),
+           firstReminderTs: (map(.ts) | min),
+           converted: $done,
+           lagMinutes: (if ($done and $doneTs != null) then (($doneTs - (map(.ts) | min)) / 60 | floor) else null end)})) as $days
+    | {days: $days,
+       totals: {reminderDays: ($days | length),
+                convertedDays: ([$days[] | select(.converted)] | length),
+                conversion: (if ($days | length) > 0
+                             then (([$days[] | select(.converted)] | length) / ($days | length) * 100 | round) else null end)},
+       timeToComplyByHour: ([$days[] | select(.converted and .lagMinutes != null)]
+                            | group_by(.firstReminderHour)
+                            | map({hour: .[0].firstReminderHour,
+                                   sessions: length,
+                                   medianLagMinutes: ((map(.lagMinutes) | sort) | .[(((length - 1) / 2) | floor)])}))}' \
+    "$EVENTS"
+}
+
+# set-policy <every-2h|bounded|once> [hours...]
+#   every-2h : fixed 06 08 10 12 14 16 (week 1 default)
+#   bounded  : explicit hours, e.g. set-policy bounded 8 13 16
+#   once     : exactly one hour, e.g. set-policy once 8
+# windowStart/windowEnd are NOT touched: they mirror the systemd timer span
+# (06:00-17:00) which decides "inside window" vs "catch-up fire".
+cmd_set_policy() {
+  local policy=${1:-}
+  shift || true
+  local hours=()
+  case $policy in
+    every-2h) hours=(6 8 10 12 14 16) ;;
+    bounded)
+      (($# >= 1)) || { echo "bounded needs hours: set-policy bounded 8 13 16" >&2; exit 1; }
+      hours=("$@") ;;
+    once)
+      (($# == 1)) || { echo "once needs exactly one hour: set-policy once 8" >&2; exit 1; }
+      hours=("$1") ;;
+    *) echo "unknown policy: $policy (every-2h|bounded|once)" >&2; exit 1 ;;
+  esac
+  mkdir -p "$(dirname "$CONFIG_PATH")"
+  local sorted
+  sorted=$(printf '%s\n' "${hours[@]}" | sort -n | paste -sd' ' -)
+  jq --arg policy "$policy" --argjson ph "$(printf '%s\n' "${hours[@]}" | jq -Rsc 'split("\n")|map(select(length>0)|tonumber)')" \
+    '.policy = $policy | .pingHours = $ph' \
+    <(load_config) > "$CONFIG_PATH"
+  echo "policy=$policy pingHours=[$sorted] (window stays $(jq -r .windowStart "$CONFIG_PATH")-$(jq -r .windowEnd "$CONFIG_PATH"), set by timer)"
+}
+
+# Sandboxed behavior tests. Never touches real state or notifications.
+cmd_self_test() {
+  local fails=0 out st m
+  tmp=$(mktemp -d)   # deliberately NOT local: the EXIT trap must see it
+  trap 'rm -rf "$tmp"' EXIT
+  printf '#!/bin/sh\necho "$@" >> "%s/notify.log"\n' "$tmp" > "$tmp/spy"
+  chmod +x "$tmp/spy"
+
+  # Everything runs in the sandbox — set env BEFORE any command runs.
+  export WRITING_STREAK_STATE_HOME="$tmp" WRITING_STREAK_CONFIG="$tmp/config.json" \
+         WRITING_STREAK_NOTIFY="$tmp/spy" WRITING_STREAK_FAKE_NOW="2026-08-19 09:00"
+
+  t() { # <desc> <expected> <actual>
+    if [[ $2 == "$3" ]]; then echo "ok - $1"; else echo "FAIL - $1: expected [$2] got [$3]"; fails=$((fails+1)); fi
+  }
+
+  # case 1: seed is one-shot
+  out=$("$0" seed 2>&1 || true) && [[ $out == seeded:* ]] || { echo "FAIL seed"; fails=$((fails+1)); }
+  [[ $(wc -l < "$tmp/events.jsonl") -eq 3 ]] || { echo "FAIL seed count"; fails=$((fails+1)); }
+  out=$("$0" seed 2>&1 || true); [[ $out == refusing* ]] || { echo "FAIL seed idempotence"; fails=$((fails+1)); }
+
+  # case 2: direct fixture — gap, restart, open states
+  rm -f "$tmp/events.jsonl"
+
+  # case 2: direct fixture — gap, restart, open states
+  for d in 2026-08-11 2026-08-12 2026-08-13 2026-08-17; do
+    jq -cn --arg d "$d" --argjson ts "$(date -d "$d 12:00" +%s)" '{type:"seed",date:$d,ts:$ts}' >> "$tmp/events.jsonl"
+  done
+
+  st=$("$0" status)
+  t "restart when yesterday missed (today open)" "restart" "$(jq -r .state <<<"$st")"
+  t "best across gap (11,12,13)" "3" "$(jq -r .best <<<"$st")"
+  t "streak 0 with restart state (token renders 1, never 0)" "0" "$(jq -r .streak <<<"$st")"
+
+  # case 3: mark -> undo -> toggle round trip
+  "$0" mark >/dev/null
+  t "today done after mark" "done" "$("$0" status | jq -r .state)"
+  t "streak counts today" "1" "$("$0" status | jq -r .streak)"
+  "$0" mark >/dev/null
+  t "mark idempotent (no dup events)" "5" "$(wc -l < "$tmp/events.jsonl")"
+  "$0" undo >/dev/null
+  t "undo returns to open-restart" "restart" "$("$0" status | jq -r .state)"
+  "$0" undo 2>/dev/null && { echo "FAIL undo without mark should error"; fails=$((fails+1)); } || echo "ok - undo without mark errors"
+  "$0" toggle >/dev/null
+  t "toggle from open marks done" "done" "$("$0" status | jq -r .state)"
+
+  # case 4: open state with live run (yesterday done, today not)
+  jq -cn --arg d 2026-08-18 --argjson ts "$(date -d "2026-08-18 12:00" +%s)" '{type:"seed",date:$d,ts:$ts}' >> "$tmp/events.jsonl"
+  "$0" undo >/dev/null
+  st=$("$0" status)
+  t "open run alive counts yesterday" "open" "$(jq -r .state <<<"$st")"
+  t "open streak = run ending yesterday" "2" "$(jq -r .streak <<<"$st")"
+
+  # case 5: check gating — hour 9 not a ping hour (every-2h) -> silent
+  rm -f "$tmp/notify.log"
+  "$0" check
+  [[ -f "$tmp/notify.log" ]] && { echo "FAIL ping at non-ping hour"; fails=$((fails+1)); } || echo "ok - no ping at non-ping hour"
+
+  # case 6: ping hour fires once, dedup blocks the double
+  export WRITING_STREAK_FAKE_NOW="2026-08-19 10:00"
+  "$0" check
+  [[ -f "$tmp/notify.log" ]] && [[ $(wc -l < "$tmp/notify.log") -eq 1 ]] || { echo "FAIL ping at 10:00"; fails=$((fails+1)); }
+  "$0" check
+  t "dedup: no second ping within 55 min" "1" "$(wc -l < "$tmp/notify.log" 2>/dev/null || echo 0)"
+  t "reminder event logged" "1" "$("$0" status | jq -r .remindersToday)"
+
+  # case 7: done day never pings
+  "$0" mark >/dev/null
+  export WRITING_STREAK_FAKE_NOW="2026-08-19 12:00"
+  "$0" check
+  t "done day: still one notification" "1" "$(wc -l < "$tmp/notify.log")"
+
+  # case 8: outside window with no reminders = catch-up ping
+  jq -cn --arg d 2026-08-20 --argjson ts "$(date -d "2026-08-20 19:30" +%s)" '{type:"completed",date:$d,ts:$ts}' >> "$tmp/events.jsonl"
+  export WRITING_STREAK_FAKE_NOW="2026-08-21 19:30"
+  "$0" check
+  t "catch-up ping outside window" "2" "$(wc -l < "$tmp/notify.log")"
+  "$0" check
+  t "catch-up pings once per day only" "2" "$(wc -l < "$tmp/notify.log")"
+
+  # case 9: metrics — conversion + lag
+  m=$("$0" metrics)
+  t "metrics: reminder days counted" "2" "$(jq -r '.totals.reminderDays' <<<"$m")"
+  t "metrics: 19th converted" "1" "$(jq -r '.totals.convertedDays' <<<"$m")"
+  t "metrics: conversion percent" "50" "$(jq -r '.totals.conversion' <<<"$m")"
+
+  # case 10: set-policy bounded rewrites config
+  "$0" set-policy bounded 8 13 16 >/dev/null
+  t "policy switched" "bounded" "$(jq -r .policy "$tmp/config.json")"
+  t "ping hours rewritten" "8 13 16" "$(jq -r '.pingHours | join(" ")' "$tmp/config.json")"
+
+  # case 11: grid shape — August 2026 starts Saturday, has 31 days
+  st=$("$0" status)
+  t "grid day count" "31" "$(jq -r '.grid | length' <<<"$st")"
+  t "Aug 2026 starts Saturday (wday 0=Sun -> 6)" "6" "$(jq -r .firstWeekday <<<"$st")"
+
+  echo "---"
+  if (( fails == 0 )); then echo "SELF-TEST PASS"; else echo "SELF-TEST FAIL ($fails)"; exit 1; fi
+}
+
+usage() {
+  cat <<'EOF'
+omarchy-writing-streak — free-writing streak + reminders (see solution doc)
+
+  mark              mark today's paper session complete (idempotent)
+  undo              undo today's mark (today only; errors if not marked)
+  toggle            mark if open, undo if done (bar right-click / IPC)
+  check             reminder gate (run hourly by systemd; reads policy config)
+  status            JSON state blob for the bar plugin
+  metrics           reminder->session conversion + time-to-comply (M3 data)
+  seed              one-shot backfill of pre-widget days (2026-08-12/13/19)
+  set-policy <every-2h|bounded|once> [hours...]
+                    switch reminder policy (08-26 review: bounded + hours)
+  self-test         sandboxed behavior tests
+
+Env overrides (tests): WRITING_STREAK_STATE_HOME, WRITING_STREAK_CONFIG,
+WRITING_STREAK_NOTIFY, WRITING_STREAK_FAKE_NOW ("YYYY-MM-DD HH:MM").
+EOF
+}
+
+case ${1:-} in
+  mark|undo|toggle|check|status|metrics|seed|set-policy|self-test) "cmd_${1//-/_}" "${@:2}" ;;
+  -h|--help|help|'') usage ;;
+  *) echo "unknown command: $1" >&2; usage; exit 1 ;;
+esac
