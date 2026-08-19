@@ -1,9 +1,10 @@
 # AGENTS.md — protocol for agents working on this plugin
 
 A tiny Omarchy shell plugin with a strict shape. Read this before changing
-anything. Full design narrative (requirements → decisions → build log) lives
-in the writing project: `~/writing/projects/free-writing/reference/`
-(`streak-reminder-widget-*.md`). The repo README carries the essentials.
+anything. The decision record with rationale is [`docs/DESIGN.md`](docs/DESIGN.md);
+the original build log and decision history live in the writing project
+(`~/writing/projects/free-writing/reference/streak-reminder-widget-*.md`) on
+the author's machine. The repo README carries the essentials.
 
 ## Non-negotiable guardrails
 

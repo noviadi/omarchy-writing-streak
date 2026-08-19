@@ -113,16 +113,13 @@ rm -f ~/.local/bin/omarchy-writing-streak ~/.config/omarchy/writing-streak.json
 
 Built for a specific practice with falsifiable success criteria (reminder→
 session conversion, same-day miss visibility, zero widget-fiddling sessions).
-The full requirements, solution design, and build log live in the writing
-project: `~/writing/projects/free-writing/reference/` —
-[requirements](../../../../writing/projects/free-writing/reference/streak-reminder-widget-requirements.md),
-[solution](../../../../writing/projects/free-writing/reference/streak-reminder-widget-solution.md),
-[implementation log](../../../../writing/projects/free-writing/reference/streak-reminder-widget-implementation-log.md).
+The full decision record — principles, rejected alternatives, reminder-policy
+lifecycle, measurement contract — is compiled in
+[`docs/DESIGN.md`](docs/DESIGN.md).
 
 **Personal config, published as reference.** The reminder copy and window
 encode one writer's morning practice; fork and tune.
 
-Deferred (decided against for v1, revisit 2026-08-26): surfacing the writing
-ping in the stock reminders surface (Super+Ctrl+Alt+R + bell indicator) by
-arming an `omarchy-reminder-*`-named display unit while keeping this timer
-as the trigger of record. Full trade-off analysis in the implementation log.
+Deferred (decided against for v1, revisit at the week-1 review): surfacing
+the writing ping in the stock reminders surface (Super+Ctrl+Alt+R + bell
+indicator). Trade-off analysis in [`docs/DESIGN.md`](docs/DESIGN.md#deferred-revisit-at-the-week-1-review).
