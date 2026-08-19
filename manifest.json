@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "noviadi.writing-streak",
+  "name": "Writing Streak",
+  "version": "1.0.0",
+  "author": "noviadi",
+  "license": "MIT",
+  "description": "Free-writing practice: always-visible run token, month grid, one-click completion, hourly reminder policy. Viewer only — all logic in omarchy-writing-streak CLI.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Writing Streak",
+    "description": "Streak token, month grid, and completion toggle for the pen-and-paper practice",
+    "category": "Productivity",
+    "aliases": [
+      "writing",
+      "streak"
+    ],
+    "allowMultiple": false
+  }
+}
