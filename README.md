@@ -68,6 +68,7 @@ omarchy-writing-streak toggle      # mark if open, undo if done
 omarchy-writing-streak status      # JSON state blob (what the bar renders)
 omarchy-writing-streak metrics     # reminder→session conversion + time-to-comply
 omarchy-writing-streak set-policy <every-2h|bounded|once> [hours...]
+omarchy-writing-streak seed <YYYY-MM-DD> [YYYY-MM-DD …]   # one-shot backfill
 omarchy-writing-streak self-test   # sandboxed behavior tests
 ```
 

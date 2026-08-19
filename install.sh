@@ -72,7 +72,7 @@ fi
 omarchy restart shell
 
 if [[ ! -s $STATE_HOME/events.jsonl ]]; then
-  echo "Note: event log is empty. Backfill pre-widget days with:"
-  echo "  omarchy-writing-streak seed"
+  echo "Note: event log is empty. Backfill complete pre-widget days with:"
+  echo "  omarchy-writing-streak seed <YYYY-MM-DD> [YYYY-MM-DD …]"
 fi
 echo "Installed $PLUGIN_ID (timer active: $(systemctl --user is-active omarchy-writing-streak.timer))."

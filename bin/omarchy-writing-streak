@@ -1,8 +1,8 @@
 #!/bin/bash
-# omarchy-writing-streak — free-writing practice streak + reminder policy.
+# omarchy-writing-streak — practice streak log + reminder policy.
 #
-# Design: writing/projects/free-writing/reference/streak-reminder-widget-solution.md
-# Build log:  .../streak-reminder-widget-implementation-log.md
+# Design and decision record: docs/DESIGN.md (repo root).
+# Usage: omarchy-writing-streak --help
 #
 # The append-only event log (~/.local/state/omarchy/writing-streak/events.jsonl)
 # is the ONLY truth. Every command either appends an event or derives state from
@@ -86,17 +86,26 @@ load_config() {
 
 # ------------------------------------------------------------------ commands
 
+# seed <date...> — one-shot backfill of complete days from before the widget.
+# Refuses a non-empty log: backfill must never run twice or race live events.
 cmd_seed() {
+  if [[ $# -lt 1 ]]; then
+    echo "seed needs dates: seed 2026-08-12 2026-08-13 …" >&2
+    exit 1
+  fi
   if [[ -s $EVENTS ]]; then
     echo "refusing to seed: $EVENTS is not empty" >&2
     exit 1
   fi
-  # Complete days per solution doc D3 (evidence: session files + NOTES.md tracker).
   local d
-  for d in 2026-08-12 2026-08-13 2026-08-19; do
+  # validate everything before appending anything
+  for d in "$@"; do
+    [[ $d =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { echo "bad date: $d (expected YYYY-MM-DD)" >&2; exit 1; }
+  done
+  for d in "$@"; do
     append_event seed "$d" "$(date -d "$d 12:00" +%s)"
   done
-  echo "seeded: 2026-08-12, 2026-08-13, 2026-08-19 (complete)"
+  echo "seeded: $* (complete)"
 }
 
 cmd_mark() {
@@ -307,10 +316,13 @@ cmd_self_test() {
     if [[ $2 == "$3" ]]; then echo "ok - $1"; else echo "FAIL - $1: expected [$2] got [$3]"; fails=$((fails+1)); fi
   }
 
-  # case 1: seed is one-shot
-  out=$("$0" seed 2>&1 || true) && [[ $out == seeded:* ]] || { echo "FAIL seed"; fails=$((fails+1)); }
+  # case 1: seed takes dates, is one-shot, and validates input
+  "$0" seed >/dev/null 2>&1 && { echo "FAIL seed without dates should error"; fails=$((fails+1)); } || echo "ok - seed without dates errors"
+  out=$("$0" seed 2026-08-10 2026-08-11 2026-08-12 2>&1 || true) && [[ $out == seeded:* ]] || { echo "FAIL seed"; fails=$((fails+1)); }
   [[ $(wc -l < "$tmp/events.jsonl") -eq 3 ]] || { echo "FAIL seed count"; fails=$((fails+1)); }
-  out=$("$0" seed 2>&1 || true); [[ $out == refusing* ]] || { echo "FAIL seed idempotence"; fails=$((fails+1)); }
+  out=$("$0" seed 2026-08-10 2>&1 || true); [[ $out == refusing* ]] || { echo "FAIL seed idempotence"; fails=$((fails+1)); }
+  rm -f "$tmp/events.jsonl"
+  "$0" seed 2026-8-1 >/dev/null 2>&1 && { echo "FAIL seed accepts bad format"; fails=$((fails+1)); } || echo "ok - seed rejects bad date format"
 
   # case 2: direct fixture — gap, restart, open states
   rm -f "$tmp/events.jsonl"
@@ -401,7 +413,7 @@ omarchy-writing-streak — free-writing streak + reminders (see solution doc)
   check             reminder gate (run hourly by systemd; reads policy config)
   status            JSON state blob for the bar plugin
   metrics           reminder->session conversion + time-to-comply (M3 data)
-  seed              one-shot backfill of pre-widget days (2026-08-12/13/19)
+  seed <date...>    one-shot backfill of complete days (refuses non-empty log)
   set-policy <every-2h|bounded|once> [hours...]
                     switch reminder policy (08-26 review: bounded + hours)
   self-test         sandboxed behavior tests
