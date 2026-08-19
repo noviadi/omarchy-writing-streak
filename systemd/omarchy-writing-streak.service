@@ -1,0 +1,6 @@
+[Unit]
+Description=Free-writing streak reminder check (omarchy-writing-streak)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/omarchy-writing-streak check
