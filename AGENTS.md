@@ -19,12 +19,15 @@ the repo README carries the essentials.
    never rewrite them (bug P9 in the build log — it once did).
 4. **The CLI's env overrides are the test harness:** `WRITING_STREAK_STATE_HOME`,
    `WRITING_STREAK_CONFIG`, `WRITING_STREAK_NOTIFY`, `WRITING_STREAK_FAKE_NOW`.
-   Tests must never touch real state or send real notifications.
+   Tests (`tests/run.sh`) must never touch real state or send real notifications.
+   The full testability boundary — what's mocked, what's real, what's manual —
+   is [`docs/TESTING.md`](docs/TESTING.md). New CLI behavior ships with a new
+   assertion in the same commit.
 
 ## Workflow
 
 ```bash
-bin/omarchy-writing-streak self-test   # before and after every change
+tests/run.sh                          # before and after every change
 ./install.sh                           # deploy after edits (repo is source of truth)
 ```
 
